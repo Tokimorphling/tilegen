@@ -1,17 +1,15 @@
-﻿"""Register tilegen as a comfy_kitchen ConvRot backend.
+"""Register tilegen as a selective comfy_kitchen ConvRot backend.
 
 When ComfyUI loads this custom node, :func:`install` registers a backend named
-``tilegen`` into comfy_kitchen's :class:`~comfy_kitchen.registry.BackendRegistry`,
-positioned between the native accelerated backends and ``eager``. Models that
-call ``int8_linear(convrot=True)`` (SCAIL-2 int8_convrot and friends) then
-dispatch here:
+``tilegen`` into comfy_kitchen's :class:`~comfy_kitchen.registry.BackendRegistry`.
+It is checked before the native accelerated backends, but its call rule accepts
+only shapes that can use FHT. Models that call ``int8_linear(convrot=True)``
+(SCAIL-2 int8_convrot and friends) then dispatch as follows:
 
 * wide K -> the fused NVRTC FHT activation kernel (tilegen.kernels)
-* small K / unsupported -> the stable PyTorch Hadamard rotation
+* small K / unsupported -> the existing ComfyUI CUDA/Triton/eager priority
 
-The INT8 GEMM + dequant reuses comfy_kitchen's IMMA path when available, so the
-only thing tilegen replaces is the (slow, on Turing) activation rotation+
-quantization — exactly where the upstream int8_convrot path regresses.
+The INT8 GEMM + dequant reuses comfy_kitchen's IMMA path when available.
 
 ``comfy_kitchen`` is a hard requirement for backend registration (the nodes in
 :mod:`tilegen.comfyui.nodes` work without it). When comfy_kitchen is absent,
@@ -23,17 +21,19 @@ import functools
 import logging
 import os
 import sys
+from collections.abc import Mapping
 
 import torch
 
-from ..runtime.device import usable_shared_bytes
 from ..quant.int8_ops import int8_matmul_dequant_chunked
+from ..runtime.device import usable_shared_bytes
 
 LOGGER = logging.getLogger("tilegen.backend")
 
 BACKEND_NAME = "tilegen"
 _INSTALLED = False
 _FAILED_FHT_SHAPES: set[tuple] = set()
+_LOGGED_DECISIONS: set[tuple] = set()
 
 
 def _mode() -> str:
@@ -72,6 +72,28 @@ def _fht_min_k(device_index: int = 0) -> int:
         return default
 
 
+def _diagnostics_enabled() -> bool:
+    return os.environ.get("TILEGEN_DIAGNOSTICS", "1").strip().lower() not in {
+        "0", "false", "off", "no",
+    }
+
+
+def _log_decision(decision: str, reason: str, x, weight, group_size: int) -> None:
+    if not _diagnostics_enabled() or not isinstance(x, torch.Tensor) or x.ndim < 2:
+        return
+    k = x.shape[-1]
+    m = x.numel() // max(1, k)
+    n = weight.shape[0] if isinstance(weight, torch.Tensor) and weight.ndim == 2 else "?"
+    key = (decision, reason, m, k, n, x.dtype, group_size)
+    if key in _LOGGED_DECISIONS:
+        return
+    _LOGGED_DECISIONS.add(key)
+    LOGGER.warning(
+        "tilegen shape %s: M=%s K=%s N=%s dtype=%s group=%s reason=%s",
+        decision, m, k, n, x.dtype, group_size, reason,
+    )
+
+
 @functools.lru_cache(maxsize=16)
 def _hadamard(device_type: str, device_index: int, dtype: torch.dtype, size: int):
     from ..kernels.hadamard import build_hadamard
@@ -104,6 +126,43 @@ def _can_use_fht(x: torch.Tensor, group_size: int, mode: str) -> bool:
     return x.shape[1] * 4 <= usable_shared_bytes(x.device.index or 0, headroom=2048)
 
 
+def _fht_applicable(kwargs: Mapping[str, object]):
+    """Registry rule that lets unsupported shapes fall through to CUDA."""
+    from comfy_kitchen.constraints import ValidationResult
+
+    mode = _mode()
+    x = kwargs.get("x")
+    weight = kwargs.get("weight")
+    convrot = kwargs.get("convrot", False)
+    group_size = int(kwargs.get("convrot_groupsize", 256))
+    if not convrot:
+        return ValidationResult.fail("convrot", "TileGen only handles ConvRot")
+    if mode not in {"auto", "fht"}:
+        _log_decision("KEEP_CUDA", f"mode={mode}", x, weight, group_size)
+        return ValidationResult.fail("__tilegen__", f"mode={mode}")
+    if not isinstance(x, torch.Tensor) or not x.is_cuda or x.ndim < 2:
+        return ValidationResult.fail("x", "CUDA tensor with at least 2 dims required")
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        return ValidationResult.fail("x", "fp16/bf16 input required")
+    k = x.shape[-1]
+    if group_size != 256 or k % 256:
+        _log_decision("KEEP_CUDA", "unsupported group/K", x, weight, group_size)
+        return ValidationResult.fail("convrot_groupsize", "requires group=256 and K divisible by 256")
+    min_k = 0 if mode == "fht" else _fht_min_k(x.device.index or 0)
+    if k < min_k:
+        _log_decision("KEEP_CUDA", f"K below min_k={min_k}", x, weight, group_size)
+        return ValidationResult.fail("x", "K below TileGen threshold")
+    if k * 4 > usable_shared_bytes(x.device.index or 0, headroom=2048):
+        _log_decision("KEEP_CUDA", "FHT row exceeds shared memory", x, weight, group_size)
+        return ValidationResult.fail("x", "FHT row exceeds shared memory")
+    shape_key = (x.numel() // k, k, x.dtype, x.device.index)
+    if shape_key in _FAILED_FHT_SHAPES:
+        _log_decision("KEEP_CUDA", "FHT previously failed", x, weight, group_size)
+        return ValidationResult.fail("x", "FHT previously failed for this shape")
+    _log_decision("ACCEPT_FHT", "all constraints passed", x, weight, group_size)
+    return ValidationResult.ok()
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -112,6 +171,7 @@ def int8_linear(
     out_dtype: torch.dtype | None = None,
     convrot: bool = False,
     convrot_groupsize: int = 256,
+    input_act: str | None = None,
 ) -> torch.Tensor:
     """Backend-compatible replacement for comfy_kitchen.int8_linear."""
     if x.shape[-1] != weight.shape[-1]:
@@ -124,7 +184,9 @@ def int8_linear(
         # This backend exists specifically for ConvRot. Preserve comfy_kitchen's
         # behavior for every other INT8 layout. Explicit eager mode is also a
         # true no-JIT compatibility path and therefore delegates directly.
-        from comfy_kitchen.backends.eager.quantization import int8_linear as eager_int8_linear
+        from comfy_kitchen.backends.eager.quantization import (
+            int8_linear as eager_int8_linear,
+        )
 
         return eager_int8_linear(
             x,
@@ -134,7 +196,12 @@ def int8_linear(
             out_dtype=out_dtype,
             convrot=convrot,
             convrot_groupsize=convrot_groupsize,
+            input_act=input_act,
         )
+    if input_act not in (None, "none"):
+        from comfy_kitchen.backends._activations import apply_input_act
+
+        x = apply_input_act(x, input_act)
     original_shape = tuple(x.shape)
     x2d = x.reshape(-1, x.shape[-1]).contiguous()
     weight = weight.to(device=x.device, dtype=torch.int8)
@@ -178,7 +245,7 @@ def int8_linear(
 
 
 def install() -> bool:
-    """Register after native accelerated backends and before eager. Idempotent."""
+    """Register selective FHT dispatch ahead of the normal backends."""
     global _INSTALLED
     mode = _mode()
     if mode == "off" or _INSTALLED:
@@ -189,22 +256,27 @@ def install() -> bool:
 
         device_index = torch.cuda.current_device() if torch.cuda.is_available() else 0
         fht_min_k = 0 if mode == "fht" else _fht_min_k(device_index)
-        constraints = registry.get_constraints("eager", "int8_linear")
-        if constraints is None:
+        from comfy_kitchen.constraints import FunctionConstraints
+
+        base = registry.get_constraints("eager", "int8_linear")
+        if base is None:
             raise RuntimeError("comfy_kitchen eager int8_linear constraints are unavailable")
+        constraints = FunctionConstraints(
+            params=base.params,
+            default_devices=base.default_devices,
+            min_compute_capability=base.min_compute_capability,
+            call_rules=(*getattr(base, "call_rules", ()), _fht_applicable),
+        )
         registry.register(BACKEND_NAME, sys.modules[__name__], {"int8_linear": constraints})
         existing = [name for name in registry._priority if name != BACKEND_NAME]
-        accelerated = [name for name in existing if name != "eager"]
-        priority = accelerated + [BACKEND_NAME]
-        if "eager" in existing:
-            priority.append("eager")
-        registry.set_priority(priority)
+        registry.set_priority([BACKEND_NAME, *existing])
         _INSTALLED = True
         LOGGER.warning(
-            "tilegen ConvRot backend enabled: mode=%s  FHT min K=%s  temp=%s MiB",
+            "tilegen selective FHT dispatch enabled: mode=%s FHT min K=%s temp=%s MiB priority=%s",
             mode,
             fht_min_k,
             os.environ.get("TILEGEN_INT8_TEMP_MB", "256"),
+            registry._priority,
         )
         return True
     except Exception:

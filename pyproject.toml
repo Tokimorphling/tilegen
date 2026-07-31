@@ -1,4 +1,4 @@
-﻿[build-system]
+[build-system]
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
@@ -23,7 +23,7 @@ dependencies = [
 
 [project.optional-dependencies]
 tilelang = ["tilelang>=0.1.12"]
-comfyui = ["comfy-kitchen"]
+comfyui = ["comfy-kitchen>=0.2.25"]
 dev = ["pytest>=7"]
 
 [tool.setuptools.packages.find]

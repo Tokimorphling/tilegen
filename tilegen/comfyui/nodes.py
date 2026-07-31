@@ -1,4 +1,4 @@
-﻿"""Standalone ComfyUI nodes for INT8 ConvRot quantization (any model).
+"""Standalone ComfyUI nodes for INT8 ConvRot quantization (any model).
 
 These expose the ConvRot quantization path as standalone ComfyUI operations,
 letting any model benefit from the tilegen FHT acceleration when using ConvRot
@@ -12,6 +12,7 @@ Typical usage::
 """
 from __future__ import annotations
 
+import logging
 import os
 
 import torch
@@ -21,6 +22,42 @@ from ..kernels.int8_convrot import _eager_quantize, quantize_convrot_fht
 from ..quant.int8_ops import int8_matmul_dequant_chunked
 from ..quant.weight import quantize_convrot_weight
 from ..runtime.device import usable_shared_bytes
+
+LOGGER = logging.getLogger("tilegen.nodes")
+
+
+class TileGenConvRotModelConfig:
+    """Workflow-visible MODEL passthrough for TileGen runtime settings."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "backend": (["auto", "fht", "off"], {"default": "auto"}),
+                "fht_min_k": ("INT", {"default": 8192, "min": 0, "max": 32768, "step": 256}),
+                "fht_impl": (["native", "tilelang"], {"default": "native"}),
+                "int8_temp_mb": ("INT", {"default": 1024, "min": 16, "max": 8192, "step": 16}),
+                "diagnostics": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "configure"
+    CATEGORY = "model/optimization/tilegen"
+
+    def configure(self, model, backend, fht_min_k, fht_impl, int8_temp_mb, diagnostics):
+        os.environ["TILEGEN_CONVROT_BACKEND"] = backend
+        os.environ["TILEGEN_FHT_MIN_K"] = str(max(0, int(fht_min_k)))
+        os.environ["TILEGEN_FHT_IMPL"] = fht_impl
+        os.environ["TILEGEN_INT8_TEMP_MB"] = str(max(16, int(int8_temp_mb)))
+        os.environ["TILEGEN_DIAGNOSTICS"] = "1" if diagnostics else "0"
+        LOGGER.warning(
+            "tilegen workflow config: backend=%s min_k=%s impl=%s temp=%sMiB diagnostics=%s",
+            backend, fht_min_k, fht_impl, int8_temp_mb, diagnostics,
+        )
+        return (model,)
 
 
 class ConvRotTestTensors:
@@ -134,7 +171,7 @@ class Int8ConvRotLinear:
     def forward(self, x, weight_quantized, weight_scale, group_size, bias=None, backend="auto"):
         original_shape = tuple(x.shape)
         x2d = x.reshape(-1, x.shape[-1]).contiguous()
-        M, K = x2d.shape
+        _, K = x2d.shape
         N = weight_quantized.shape[0]
         if K % group_size != 0:
             raise ValueError(f"K={K} must be divisible by group_size={group_size}")

@@ -1,4 +1,4 @@
-﻿# tilegen
+# tilegen
 
 tilelang / NVRTC acceleration kernels for **DiT (diffusion transformer)** inference, plus a clean ComfyUI integration.
 
@@ -25,9 +25,8 @@ tilegen/
 │   ├── runtime/             #   self-contained NVRTC bootstrap + device caps
 │   ├── kernels/             #   hadamard + int8_convrot (native NVRTC + tilelang)
 │   └── quant/               #   weight quant + INT8 GEMM/dequant (comfy_kitchen optional)
-├── comfyui/                 # ComfyUI custom node (drop into custom_nodes/)
-│   ├── backend.py           #   auto-registers as a comfy_kitchen backend
-│   └── nodes.py             #   standalone QuantizeConvRotWeight / Int8ConvRotLinear
+├── tilegen/comfyui/         # native ComfyUI backend + node implementation
+├── comfyui/                 # thin drop-in custom_nodes loader
 ├── benchmarks/  tests/
 ```
 
@@ -46,10 +45,20 @@ pip install -e .
 
 ## Install (ComfyUI integration)
 
-Symlink or copy `comfyui/` into `ComfyUI/custom_nodes/tilegen/` and restart ComfyUI. On startup the backend registers automatically:
+Install the ComfyUI extra, then symlink or copy the top-level `comfyui/` loader
+into `ComfyUI/custom_nodes/tilegen/` and restart ComfyUI:
+
+```bash
+pip install -e '.[comfyui]'
+ln -s "$(pwd)/comfyui" /path/to/ComfyUI/custom_nodes/tilegen
+```
+
+The loader imports the installed `tilegen.comfyui` package, so its relative
+imports resolve normally instead of escaping the custom-node package. On
+startup the backend registers automatically:
 
 ```
-tilegen ConvRot backend enabled: mode=auto  FHT min K=5120  temp=256 MiB
+tilegen selective FHT dispatch enabled: mode=auto FHT min K=5120 temp=256 MiB
 ```
 
 Any model calling `int8_linear(convrot=True)` (SCAIL-2 int8_convrot, etc.) then dispatches through the FHT kernel. No workflow changes are needed — the acceleration is transparent to model-internal layers.
